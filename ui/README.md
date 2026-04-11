@@ -135,25 +135,6 @@ All components follow the AnchorKit design system:
 - Safari 14+
 - Mobile browsers (iOS Safari, Chrome Mobile)
 
-## Contributing
-
-We welcome contributions! Please:
-
-1. Follow the AnchorKit design system
-2. Maintain accessibility standards
-3. Add tests for new features
-4. Update documentation
-5. Ensure responsive design
-
-### Adding a New Component
-
-1. Create component file: `components/YourComponent.tsx`
-2. Create styles: `components/YourComponent.css`
-3. Create tests: `components/YourComponent.test.tsx`
-4. Create examples: `components/YourComponent.example.tsx`
-5. Add documentation: Update `components/README.md`
-6. Export from `components/index.ts`
-
 ## Testing
 
 All components include comprehensive test suites:

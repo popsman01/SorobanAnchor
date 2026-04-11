@@ -332,16 +332,6 @@ test('copies cURL to clipboard', async () => {
 });
 ```
 
-## Contributing
-
-When contributing to this component:
-
-1. Follow the AnchorKit design system (8pt grid)
-2. Maintain accessibility standards
-3. Add tests for new features
-4. Update documentation
-5. Ensure responsive design works
-
 ## License
 
 Part of the AnchorKit project.
