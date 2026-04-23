@@ -5,7 +5,9 @@ use soroban_sdk::{
 
 use crate::deterministic_hash::{compute_payload_hash, verify_payload_hash};
 use crate::errors::ErrorCode;
+use crate::rate_limiter::RateLimiter;
 use crate::sep10_jwt;
+use crate::transaction_state_tracker::{TransactionState, TransactionStateRecord};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -287,6 +289,15 @@ pub struct EndpointUpdated {
     pub endpoint: String,
 }
 
+#[contracttype]
+#[derive(Clone)]
+struct TxStateChangedEvent {
+    transaction_id: u64,
+    old_state: u32,
+    new_state: u32,
+    timestamp: u64,
+}
+
 // ---------------------------------------------------------------------------
 // TTLs (in ledgers)
 // ---------------------------------------------------------------------------
@@ -542,7 +553,13 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     ) -> u64 {
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
+        Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
+
+        let config = RateLimiter::get_config(&env);
+        if RateLimiter::check_and_increment(&env, &issuer, &config).is_err() {
+            panic_with_error!(&env, ErrorCode::RateLimitExceeded);
+        }
 
         let used_key = (symbol_short!("USED"), payload_hash.clone());
         if env.storage().persistent().has(&used_key) {
@@ -593,6 +610,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     ) -> u64 {
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
+        Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
 
         let used_key = (symbol_short!("USED"), payload_hash.clone());
@@ -854,6 +872,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     ) -> u64 {
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
+        Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
 
         let used_key = (symbol_short!("USED"), payload_hash.clone());
@@ -1395,8 +1414,50 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     }
 
     // -----------------------------------------------------------------------
+    // Transaction state
+    // -----------------------------------------------------------------------
+
+    pub fn create_transaction_record(
+        env: Env,
+        transaction_id: u64,
+        initiator: Address,
+    ) -> TransactionStateRecord {
+        let now = env.ledger().timestamp();
+        let record = TransactionStateRecord {
+            transaction_id,
+            state: TransactionState::Pending,
+            initiator,
+            timestamp: now,
+            last_updated: now,
+            error_message: None,
+        };
+        let key = (symbol_short!("TXSTATE"), transaction_id);
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        record
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limit configuration
+    // -----------------------------------------------------------------------
+
+    pub fn set_rate_limit_config(env: Env, max_submissions: u32, window_length: u32) {
+        Self::require_admin(&env);
+        let config = crate::rate_limiter::RateLimitConfig { max_submissions, window_length };
+        RateLimiter::update_config(&env, &Self::get_admin(env.clone()), &config)
+            .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::ValidationError));
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    fn enforce_rate_limit(env: &Env, attestor: &Address) {
+        let config = RateLimiter::get_config(env);
+        if RateLimiter::check_and_increment(env, attestor, &config).is_err() {
+            panic_with_error!(env, ErrorCode::RateLimitExceeded);
+        }
+    }
 
     fn require_admin(env: &Env) {
         let admin: Address = env
