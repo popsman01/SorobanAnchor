@@ -157,6 +157,37 @@ pub struct RoutingOptions {
 }
 
 // ---------------------------------------------------------------------------
+// KYC and Compliance types
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum KycStatus {
+    Pending = 0,
+    Approved = 1,
+    Rejected = 2,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ComplianceCheck {
+    pub subject: Address,
+    pub check_type: String,
+    pub result: u32,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct KycRecord {
+    pub subject: Address,
+    pub status: u32,
+    pub timestamp: u64,
+    pub rejection_reason_hash: Option<Bytes>,
+}
+
+// ---------------------------------------------------------------------------
 // Metadata cache types
 // ---------------------------------------------------------------------------
 
@@ -311,6 +342,14 @@ const INSTANCE_TTL: u32 = 518_400;
 
 fn admin_key(env: &Env) -> soroban_sdk::Vec<soroban_sdk::Symbol> {
     soroban_sdk::vec![env, symbol_short!("ADMIN")]
+}
+
+fn kyc_record_key(subject: &Address) -> (Symbol, Address) {
+    (symbol_short!("KYC"), subject.clone())
+}
+
+fn compliance_check_key(subject: &Address, check_type: &String) -> (Symbol, Address, String) {
+    (symbol_short!("COMP"), subject.clone(), check_type.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +598,74 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         let config = RateLimiter::get_config(&env);
         if RateLimiter::check_and_increment(&env, &issuer, &config).is_err() {
             panic_with_error!(&env, ErrorCode::RateLimitExceeded);
+        }
+
+        let used_key = (symbol_short!("USED"), payload_hash.clone());
+        if env.storage().persistent().has(&used_key) {
+            panic_with_error!(&env, ErrorCode::ReplayAttack);
+        }
+
+        let id = Self::next_attestation_id(&env);
+        Self::store_attestation(
+            &env,
+            id,
+            issuer.clone(),
+            subject.clone(),
+            timestamp,
+            payload_hash.clone(),
+            signature,
+        );
+
+        env.storage().persistent().set(&used_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&used_key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        env.events().publish(
+            (
+                symbol_short!("attest"),
+                symbol_short!("recorded"),
+                id,
+                subject,
+            ),
+            AttestEvent { payload_hash, timestamp },
+        );
+
+        id
+    }
+
+    // -----------------------------------------------------------------------
+    // Attestation submission with KYC enforcement
+    // -----------------------------------------------------------------------
+
+    pub fn submit_attestation_with_kyc_check(
+        env: Env,
+        issuer: Address,
+        subject: Address,
+        timestamp: u64,
+        payload_hash: Bytes,
+        signature: Bytes,
+        require_kyc: bool,
+    ) -> u64 {
+        issuer.require_auth();
+        Self::check_attestor(&env, &issuer);
+        Self::check_timestamp(&env, timestamp);
+
+        // Check KYC if required
+        if require_kyc {
+            let key = kyc_record_key(&subject);
+            let kyc_record: KycRecord = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
+
+            match kyc_record.status {
+                1 => {}, // Approved - continue
+                0 => panic_with_error!(&env, ErrorCode::KycPending),
+                2 => panic_with_error!(&env, ErrorCode::KycRejected),
+                _ => panic_with_error!(&env, ErrorCode::KycNotFound),
+            }
         }
 
         let used_key = (symbol_short!("USED"), payload_hash.clone());
