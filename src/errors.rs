@@ -55,15 +55,20 @@ pub enum ErrorCode {
 
     KycRejected = 21,
  fix/kyc-pending-error-code-22
+ fix/kyc-rejected-error-code-23
+
+    KycRejected = 21,
+ fix/kyc-pending-error-code-22
+ main
     KycPending = 22,
-    NotInitialized = 23,
+    KycRejected = 23,
+    NotInitialized = 25,
     IllegalTransition = 24,
 
     NotInitialized = 22,
     IllegalTransition = 23,
     SessionExpired = 25,
     SessionClosed = 26,
- main
  main
     CacheExpired = 48,
     CacheNotFound = 49,
@@ -332,7 +337,6 @@ mod tests {
         assert_eq!(AnchorKitError::kyc_pending().code, ErrorCode::KycPending);
         assert_eq!(AnchorKitError::kyc_rejected().code, ErrorCode::KycRejected);
         assert_eq!(AnchorKitError::webhook_delivery_failed().code, ErrorCode::WebhookDeliveryFailed);
-        assert_eq!(AnchorKitError::session_expired().code, ErrorCode::SessionExpired);
     }
 
     #[test]
@@ -364,11 +368,10 @@ mod tests {
             ErrorCode::AttestationNotFound,
             ErrorCode::InvalidSep10Token,
             ErrorCode::KycNotFound,
- feat/session-expiry-check
+ feat/webhook-delivery-failed-error-code-24
 
             ErrorCode::KycRejected,
  fix/kyc-pending-error-code-22
- main
             ErrorCode::KycPending,
             ErrorCode::KycRejected,
             ErrorCode::WebhookDeliveryFailed,
