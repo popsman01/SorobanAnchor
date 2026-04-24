@@ -44,11 +44,13 @@ pub enum ErrorCode {
     RateLimitExceeded = 16,
     AttestationNotFound = 17,
     InvalidSep10Token = 18,
-    NotInitialized = 20,
-    KycNotFound = 21,
-    KycPending = 22,
-    KycRejected = 23,
-    IllegalTransition = 24,
+    KycNotFound = 19,
+    KycPending = 20,
+    KycRejected = 21,
+    NotInitialized = 22,
+    IllegalTransition = 23,
+    SessionExpired = 25,
+    SessionClosed = 26,
     CacheExpired = 48,
     CacheNotFound = 49,
 }
@@ -82,6 +84,8 @@ impl ErrorCode {
             ErrorCode::CacheExpired => "Cache entry has expired",
             ErrorCode::CacheNotFound => "Cache entry not found",
             ErrorCode::IllegalTransition => "Illegal transaction state transition",
+            ErrorCode::SessionExpired => "Session has expired",
+            ErrorCode::SessionClosed => "Session is closed",
         }
     }
 }
@@ -227,6 +231,14 @@ impl AnchorKitError {
             &alloc::format!("{} -> {}", from, to),
         )
     }
+
+    pub fn session_expired() -> Self {
+        Self::from_code(ErrorCode::SessionExpired)
+    }
+
+    pub fn session_closed() -> Self {
+        Self::from_code(ErrorCode::SessionClosed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +341,9 @@ mod tests {
             ErrorCode::IllegalTransition,
             ErrorCode::CacheExpired,
             ErrorCode::CacheNotFound,
+            ErrorCode::IllegalTransition,
+            ErrorCode::SessionExpired,
+            ErrorCode::SessionClosed,
         ];
         for code in codes {
             assert!(!code.default_message().is_empty());
