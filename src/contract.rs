@@ -1015,6 +1015,12 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         valid_until: u64,
     ) -> u64 {
         anchor.require_auth();
+
+        // Issue #53: reject quotes that are already expired at submission time
+        if valid_until <= env.ledger().timestamp() {
+            panic_with_error!(&env, ErrorCode::StaleQuote);
+        }
+
         let inst = env.storage().instance();
         let qcnt_key = soroban_sdk::vec![&env, symbol_short!("QCNT")];
         let next: u64 = inst.get(&qcnt_key).unwrap_or(0u64) + 1;
@@ -1502,6 +1508,33 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
                     .unwrap_or(0);
                 if rep > best_rep {
                     best_rep = rep;
+                    best = q;
+                }
+            }
+        } else if strategy_sym == Symbol::new(&env, "WeightedScore") {
+            // Issue #55: weighted score = reputation(40%) + liquidity(30%) + uptime(20%) - fee(10%)
+            // All component scores are u32 (0-100 range), fee_percentage is also u32.
+            // Score = reputation*40 + liquidity*30 + uptime*20 + (100 - fee_pct)*10
+            let weighted_score = |meta: &RoutingAnchorMeta, fee_pct: u32| -> u64 {
+                let fee_factor = if fee_pct <= 100 { 100 - fee_pct } else { 0 };
+                (meta.reputation_score as u64) * 40
+                    + (meta.liquidity_score as u64) * 30
+                    + (meta.uptime_percentage as u64) * 20
+                    + (fee_factor as u64) * 10
+            };
+            let meta_key = (symbol_short!("ANCHMETA"), best.anchor.clone());
+            let mut best_score: u64 = env.storage().persistent()
+                .get::<_, RoutingAnchorMeta>(&meta_key)
+                .map(|m| weighted_score(&m, best.fee_percentage))
+                .unwrap_or(0);
+            for q in candidates.iter() {
+                let mk = (symbol_short!("ANCHMETA"), q.anchor.clone());
+                let score = env.storage().persistent()
+                    .get::<_, RoutingAnchorMeta>(&mk)
+                    .map(|m| weighted_score(&m, q.fee_percentage))
+                    .unwrap_or(0);
+                if score > best_score {
+                    best_score = score;
                     best = q;
                 }
             }
