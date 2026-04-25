@@ -1897,6 +1897,8 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         initiator: Address,
     ) -> TransactionStateRecord {
         let now = env.ledger().timestamp();
+        let mut history = soroban_sdk::Vec::new(&env);
+        history.push_back((TransactionState::Pending, now));
         let record = TransactionStateRecord {
             transaction_id,
             state: TransactionState::Pending,
@@ -1904,6 +1906,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             timestamp: now,
             last_updated: now,
             error_message: None,
+            state_history: history,
         };
         let key = (symbol_short!("TXSTATE"), transaction_id);
         env.storage().persistent().set(&key, &record);
