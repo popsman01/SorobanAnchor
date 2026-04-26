@@ -12,9 +12,11 @@ mod transaction_state_tracker;
 pub mod sep6;
 pub mod sep24;
 pub mod contract;
+pub mod stellar_toml;
 
 pub use domain_validator::validate_anchor_domain;
 pub use errors::{AnchorKitError, ErrorCode};
+pub use stellar_toml::{ParsedStellarToml, parse_stellar_toml, fetch_stellar_toml_url};
 
 /// Backward-compatible alias. Prefer [`AnchorKitError`] for new code.
 pub use errors::Error;
@@ -24,7 +26,7 @@ pub use response_validator::{
     validate_withdraw_response, AnchorInfoResponse, DepositResponse as ValidatorDepositResponse,
     QuoteResponse, WithdrawResponse,
 };
-pub use retry::{retry_with_backoff, is_retryable, RetryConfig};
+pub use retry::{retry_with_backoff, is_retryable, RetryConfig, JitterSource, LedgerJitterSource, MockJitterSource};
 pub use deterministic_hash::{compute_payload_hash, verify_payload_hash};
 
 #[cfg(test)]
@@ -74,6 +76,9 @@ mod sep10_contract_tests;
 mod routing_tests;
 
 #[cfg(test)]
+mod attestation_sig_tests;
+
+#[cfg(test)]
 mod deterministic_hash_snapshot_tests {
     // Snapshot tests live inside deterministic_hash module itself.
     // This module exists to satisfy the test_snapshots/deterministic_hash_tests path.
@@ -85,4 +90,4 @@ mod capability_detection_tests;
 mod attestor_endpoint_tests;
 
 #[cfg(test)]
-mod replay_protection_tests;
+mod stellar_toml_tests;

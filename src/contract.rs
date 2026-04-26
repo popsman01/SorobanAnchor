@@ -163,6 +163,54 @@ pub struct RoutingOptions {
     pub subject: Address,
 }
 
+/// Composite weighted routing strategy.
+/// `fee_weight + speed_weight + reputation_weight` must equal 1.0.
+pub struct WeightedRoutingStrategy {
+    pub fee_weight: f32,
+    pub speed_weight: f32,
+    pub reputation_weight: f32,
+}
+
+impl WeightedRoutingStrategy {
+    /// Validate that weights sum to 1.0 (within floating-point tolerance).
+    pub fn validate(&self) -> bool {
+        let sum = self.fee_weight + self.speed_weight + self.reputation_weight;
+        (sum - 1.0_f32).abs() < 1e-4
+    }
+
+    /// Compute a normalized composite score in [0.0, 1.0].
+    /// Lower fee and faster settlement are better; higher reputation is better.
+    /// Each dimension is normalised against the provided max values.
+    pub fn score_anchor(
+        &self,
+        fee_pct: u32,
+        settlement_time: u64,
+        reputation: u32,
+        max_fee: u32,
+        max_settlement: u64,
+        max_reputation: u32,
+    ) -> f32 {
+        let fee_score = if max_fee == 0 {
+            1.0_f32
+        } else {
+            1.0_f32 - (fee_pct as f32 / max_fee as f32)
+        };
+        let speed_score = if max_settlement == 0 {
+            1.0_f32
+        } else {
+            1.0_f32 - (settlement_time as f32 / max_settlement as f32)
+        };
+        let rep_score = if max_reputation == 0 {
+            0.0_f32
+        } else {
+            reputation as f32 / max_reputation as f32
+        };
+        self.fee_weight * fee_score
+            + self.speed_weight * speed_score
+            + self.reputation_weight * rep_score
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KYC and Compliance types
 // ---------------------------------------------------------------------------
@@ -171,9 +219,11 @@ pub struct RoutingOptions {
 #[derive(Clone, Debug, PartialEq)]
 #[repr(u32)]
 pub enum KycStatus {
-    Pending = 0,
-    Approved = 1,
-    Rejected = 2,
+    NotSubmitted = 0,
+    Pending = 1,
+    Approved = 2,
+    Rejected = 3,
+    Expired = 4,
 }
 
 #[contracttype]
@@ -190,7 +240,9 @@ pub struct ComplianceCheck {
 pub struct KycRecord {
     pub subject: Address,
     pub status: u32,
-    pub timestamp: u64,
+    pub submitted_at: u64,
+    pub reviewed_at: Option<u64>,
+    pub expiry: Option<u64>,
     pub rejection_reason_hash: Option<Bytes>,
 }
 
@@ -216,6 +268,10 @@ pub struct MetadataCache {
     pub metadata: AnchorMetadata,
     pub cached_at: u64,
     pub ttl_seconds: u64,
+    /// Grace period after `ttl_seconds` during which stale data may be served.
+    pub stale_ttl_seconds: u64,
+    /// Set to `true` when the entry is within the stale window; caller should refresh.
+    pub needs_refresh: bool,
 }
 
 #[contracttype]
@@ -373,6 +429,10 @@ fn compliance_check_key(subject: &Address, check_type: &String) -> (Symbol, Addr
     (symbol_short!("COMP"), subject.clone(), check_type.clone())
 }
 
+fn anchor_meta_opt(env: &Env, anchor: &Address) -> Option<RoutingAnchorMeta> {
+    env.storage().persistent().get(&(symbol_short!("ANCHMETA"), anchor.clone()))
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -471,6 +531,29 @@ impl AnchorKitContract {
             .unwrap_or(sep10_jwt::MAX_JWT_LEN)
     }
 
+    /// Configure the clock skew tolerance (seconds) used by `verify_sep10_jwt`. Admin-only.
+    /// Falls back to 60 s when not set. Maximum allowed value is 300 s.
+    pub fn set_jwt_skew(env: Env, skew_seconds: u64) {
+        Self::require_admin(&env);
+        if skew_seconds > 300 {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+        env.storage()
+            .instance()
+            .set(&symbol_short!("JWTSKEW"), &skew_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
+    }
+
+    /// Return the currently configured JWT clock skew tolerance in seconds (defaults to 60).
+    pub fn get_jwt_skew(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get::<_, u64>(&symbol_short!("JWTSKEW"))
+            .unwrap_or(sep10_jwt::DEFAULT_CLOCK_SKEW)
+    }
+
     /// Verifies a SEP-10 JWT (JWS compact, EdDSA) using the stored key for `issuer`: signature, `exp`, and `sub`.
     pub fn verify_sep10_token(env: Env, token: String, issuer: Address) {
         let pk: Bytes = env
@@ -524,7 +607,7 @@ impl AnchorKitContract {
         }
     }
 
-    pub fn register_attestor(env: Env, attestor: Address, sep10_token: String, sep10_issuer: Address) {
+    pub fn register_attestor(env: Env, attestor: Address, sep10_token: String, sep10_issuer: Address, public_key: BytesN<32>) {
         Self::require_admin(&env);
         Self::verify_sep10_token_matches_attestor(&env, &sep10_token, &sep10_issuer, &attestor);
         let key = (symbol_short!("ATTESTOR"), attestor.clone());
@@ -535,6 +618,11 @@ impl AnchorKitContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        let pk_key = (symbol_short!("ATPUBKEY"), attestor.clone());
+        env.storage().persistent().set(&pk_key, &public_key);
+        env.storage()
+            .persistent()
+            .extend_ttl(&pk_key, PERSISTENT_TTL, PERSISTENT_TTL);
         env.events().publish(
             (symbol_short!("attestor"), symbol_short!("added"), attestor),
             (),
@@ -548,6 +636,8 @@ impl AnchorKitContract {
             panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
         }
         env.storage().persistent().remove(&key);
+        let pk_key = (symbol_short!("ATPUBKEY"), attestor.clone());
+        env.storage().persistent().remove(&pk_key);
         env.events().publish(
             (symbol_short!("attestor"), symbol_short!("removed"), attestor),
             (),
@@ -691,6 +781,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     ) -> u64 {
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
+        Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
         Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
 
@@ -748,22 +839,22 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     ) -> u64 {
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
+        Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
         Self::check_timestamp(&env, timestamp);
 
         // Check KYC if required
         if require_kyc {
-            let key = kyc_record_key(&subject);
-            let kyc_record: KycRecord = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
-
-            match kyc_record.status {
-                1 => {}, // Approved - continue
-                0 => panic_with_error!(&env, ErrorCode::KycPending),
-                2 => panic_with_error!(&env, ErrorCode::KycRejected),
-                _ => panic_with_error!(&env, ErrorCode::KycNotFound),
+            let kyc_status = Self::get_kyc_status(env.clone(), subject.clone());
+            
+            // Only Approved status allows attestation
+            if kyc_status != KycStatus::Approved {
+                match kyc_status {
+                    KycStatus::Pending => panic_with_error!(&env, ErrorCode::KycPending),
+                    KycStatus::Rejected => panic_with_error!(&env, ErrorCode::KycRejected),
+                    KycStatus::Expired => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                    KycStatus::NotSubmitted => panic_with_error!(&env, ErrorCode::KycNotFound),
+                    _ => panic_with_error!(&env, ErrorCode::ComplianceNotMet),
+                }
             }
         }
 
@@ -826,6 +917,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     ) -> u64 {
         issuer.require_auth();
         Self::check_attestor(&env, &issuer);
+        Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
         Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
 
@@ -992,22 +1084,42 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     // -----------------------------------------------------------------------
 
     /// Submit KYC data for a subject. Stores SHA-256 hash of KYC payload.
-    /// Never stores raw PII, only the hash.
-    pub fn submit_kyc_data(
+    /// Never stores raw PII, only the hash. Creates a KycRecord with Pending status.
+    /// Requires attestor authorization.
+    pub fn submit_kyc(
         env: Env,
         subject: Address,
-        kyc_hash: Bytes,
+        data_hash: Bytes,
         attestor: Address,
     ) {
         attestor.require_auth();
         Self::check_attestor(&env, &attestor);
 
-        let key = (symbol_short!("KYC"), subject.clone());
         let now = env.ledger().timestamp();
+        let key = kyc_record_key(&subject);
 
-        // Store KYC status as Pending initially
-        env.storage().persistent().set(&key, &(kyc_hash.clone(), now));
+        // Check if KYC already submitted
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, ErrorCode::ComplianceNotMet);
+        }
+
+        // Create new KYC record with Pending status
+        let record = KycRecord {
+            subject: subject.clone(),
+            status: KycStatus::Pending as u32,
+            submitted_at: now,
+            reviewed_at: None,
+            expiry: None,
+            rejection_reason_hash: None,
+        };
+
+        env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        // Store the data hash separately for reference
+        let data_key = (symbol_short!("KYCDATA"), subject.clone());
+        env.storage().persistent().set(&data_key, &data_hash);
+        env.storage().persistent().extend_ttl(&data_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
         env.events().publish(
             (symbol_short!("kyc"), symbol_short!("submitted"), subject),
@@ -1015,33 +1127,112 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
                 event_type: String::from_str(&env, "kyc_submitted"),
                 transaction_id: 0,
                 timestamp: now,
-                payload_hash: kyc_hash,
+                payload_hash: data_hash,
+            },
+        );
+    }
+
+    /// Approve KYC for a subject. Requires admin authorization.
+    /// Transitions status from Pending to Approved and sets reviewed_at timestamp.
+    pub fn approve_kyc(env: Env, subject: Address) {
+        Self::require_admin(&env);
+        let now = env.ledger().timestamp();
+        let key = kyc_record_key(&subject);
+
+        let mut record: KycRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
+
+        // Only allow approval from Pending state
+        if record.status != KycStatus::Pending as u32 {
+            panic_with_error!(&env, ErrorCode::IllegalTransition);
+        }
+
+        record.status = KycStatus::Approved as u32;
+        record.reviewed_at = Some(now);
+
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        env.events().publish(
+            (symbol_short!("kyc"), symbol_short!("approved"), subject),
+            WebhookEvent {
+                event_type: String::from_str(&env, "kyc_approved"),
+                transaction_id: 0,
+                timestamp: now,
+                payload_hash: Bytes::new(&env),
+            },
+        );
+    }
+
+    /// Reject KYC for a subject. Requires admin authorization.
+    /// Transitions status from Pending to Rejected and stores rejection reason hash.
+    pub fn reject_kyc(env: Env, subject: Address, reason_hash: Bytes) {
+        Self::require_admin(&env);
+        let now = env.ledger().timestamp();
+        let key = kyc_record_key(&subject);
+
+        let mut record: KycRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
+
+        // Only allow rejection from Pending state
+        if record.status != KycStatus::Pending as u32 {
+            panic_with_error!(&env, ErrorCode::IllegalTransition);
+        }
+
+        record.status = KycStatus::Rejected as u32;
+        record.reviewed_at = Some(now);
+        record.rejection_reason_hash = Some(reason_hash.clone());
+
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+
+        env.events().publish(
+            (symbol_short!("kyc"), symbol_short!("rejected"), subject),
+            WebhookEvent {
+                event_type: String::from_str(&env, "kyc_rejected"),
+                transaction_id: 0,
+                timestamp: now,
+                payload_hash: reason_hash,
             },
         );
     }
 
     /// Get the KYC status for a subject.
-    /// Returns KycStatus (Pending, Approved, Rejected).
-    /// Panics with AttestationNotFound if no KYC record exists.
+    /// Returns KycStatus enum value. Returns NotSubmitted if no record exists.
     pub fn get_kyc_status(env: Env, subject: Address) -> KycStatus {
-        let key = (symbol_short!("KYC"), subject.clone());
-        let status_key = (symbol_short!("KYCSTATUS"), subject);
+        let key = kyc_record_key(&subject);
 
-        // Check if KYC record exists
+        // Return NotSubmitted if no KYC record exists
         if !env.storage().persistent().has(&key) {
-            panic_with_error!(&env, ErrorCode::AttestationNotFound);
+            return KycStatus::NotSubmitted;
         }
 
-        // Get the status, default to Pending if not set
-        let status: u32 = env.storage().persistent()
-            .get(&status_key)
-            .unwrap_or(0u32);
+        let record: KycRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::KycNotFound));
 
-        match status {
-            0 => KycStatus::Pending,
-            1 => KycStatus::Approved,
-            2 => KycStatus::Rejected,
-            _ => KycStatus::Pending,
+        // Check if KYC has expired
+        if let Some(expiry) = record.expiry {
+            if env.ledger().timestamp() > expiry {
+                return KycStatus::Expired;
+            }
+        }
+
+        match record.status {
+            0 => KycStatus::NotSubmitted,
+            1 => KycStatus::Pending,
+            2 => KycStatus::Approved,
+            3 => KycStatus::Rejected,
+            4 => KycStatus::Expired,
+            _ => KycStatus::NotSubmitted,
         }
     }
 
@@ -1229,6 +1420,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         issuer.require_auth();
         Self::require_session_open(&env, session_id);
         Self::check_attestor(&env, &issuer);
+        Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
         Self::enforce_rate_limit(&env, &issuer);
         Self::check_timestamp(&env, timestamp);
 
@@ -1320,7 +1512,7 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         id
     }
 
-    pub fn register_attestor_with_session(env: Env, session_id: u64, attestor: Address) {
+    pub fn register_attestor_with_session(env: Env, session_id: u64, attestor: Address, public_key: BytesN<32>) {
         Self::require_admin(&env);
         Self::require_session_open(&env, session_id);
         let key = (symbol_short!("ATTESTOR"), attestor.clone());
@@ -1329,6 +1521,9 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         }
         env.storage().persistent().set(&key, &true);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
+        let pk_key = (symbol_short!("ATPUBKEY"), attestor.clone());
+        env.storage().persistent().set(&pk_key, &public_key);
+        env.storage().persistent().extend_ttl(&pk_key, PERSISTENT_TTL, PERSISTENT_TTL);
 
         let sopcnt_key = (symbol_short!("SOPCNT"), session_id);
         let op_index: u64 = env.storage().persistent().get(&sopcnt_key).unwrap_or(0u64);
@@ -1389,6 +1584,8 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             panic_with_error!(&env, ErrorCode::AttestorNotRegistered);
         }
         env.storage().persistent().remove(&key);
+        let pk_key = (symbol_short!("ATPUBKEY"), attestor.clone());
+        env.storage().persistent().remove(&pk_key);
 
         let sopcnt_key = (symbol_short!("SOPCNT"), session_id);
         let op_index: u64 = env.storage().persistent().get(&sopcnt_key).unwrap_or(0u64);
@@ -1489,7 +1686,13 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
     pub fn cache_metadata(env: Env, anchor: Address, metadata: AnchorMetadata, ttl_seconds: u64) {
         Self::require_admin(&env);
         let now = env.ledger().timestamp();
-        let entry = MetadataCache { metadata, cached_at: now, ttl_seconds };
+        let entry = MetadataCache {
+            metadata,
+            cached_at: now,
+            ttl_seconds,
+            stale_ttl_seconds: 0,
+            needs_refresh: false,
+        };
         let key = (symbol_short!("METACACHE"), anchor);
         let ledger_ttl = if ttl_seconds as u32 > MIN_TEMP_TTL { ttl_seconds as u32 } else { MIN_TEMP_TTL };
         env.storage().temporary().set(&key, &entry);
@@ -1511,6 +1714,83 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         Self::require_admin(&env);
         let key = (symbol_short!("METACACHE"), anchor);
         env.storage().temporary().remove(&key);
+    }
+
+    /// Store a metadata entry with a stale-while-revalidate grace period.
+    /// After `ttl_seconds` the entry becomes stale; after `ttl_seconds + stale_ttl_seconds`
+    /// it is fully expired and `get_cached_metadata_swr` will return an error.
+    pub fn cache_metadata_swr(
+        env: Env,
+        anchor: Address,
+        metadata: AnchorMetadata,
+        ttl_seconds: u64,
+        stale_ttl_seconds: u64,
+    ) {
+        Self::require_admin(&env);
+        let now = env.ledger().timestamp();
+        let entry = MetadataCache {
+            metadata,
+            cached_at: now,
+            ttl_seconds,
+            stale_ttl_seconds,
+            needs_refresh: false,
+        };
+        let key = (symbol_short!("METACACHE"), anchor);
+        let total_ttl = ttl_seconds.saturating_add(stale_ttl_seconds);
+        let ledger_ttl = if total_ttl as u32 > MIN_TEMP_TTL { total_ttl as u32 } else { MIN_TEMP_TTL };
+        env.storage().temporary().set(&key, &entry);
+        env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
+    }
+
+    /// Retrieve a metadata entry using the stale-while-revalidate policy.
+    ///
+    /// Returns `(metadata, needs_refresh)`:
+    /// - `needs_refresh = false` → entry is fresh (within primary TTL)
+    /// - `needs_refresh = true`  → entry is stale (within grace period); caller should refresh
+    ///
+    /// Panics with `CacheExpired` once both TTLs have elapsed, or `CacheNotFound` if absent.
+    pub fn get_cached_metadata_swr(env: Env, anchor: Address) -> (AnchorMetadata, bool) {
+        let key = (symbol_short!("METACACHE"), anchor.clone());
+        let mut entry: MetadataCache = env.storage().temporary().get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::CacheNotFound));
+        let now = env.ledger().timestamp();
+        let age = now.saturating_sub(entry.cached_at);
+
+        if age <= entry.ttl_seconds {
+            // Fresh
+            (entry.metadata, false)
+        } else if age <= entry.ttl_seconds.saturating_add(entry.stale_ttl_seconds) {
+            // Stale — mark needs_refresh and persist the flag
+            entry.needs_refresh = true;
+            env.storage().temporary().set(&key, &entry);
+            (entry.metadata, true)
+        } else {
+            panic_with_error!(&env, ErrorCode::CacheExpired);
+        }
+    }
+
+    /// Unconditionally replace the cached metadata entry, resetting both TTL clocks.
+    pub fn force_refresh_metadata(
+        env: Env,
+        anchor: Address,
+        metadata: AnchorMetadata,
+        ttl_seconds: u64,
+        stale_ttl_seconds: u64,
+    ) {
+        Self::require_admin(&env);
+        let now = env.ledger().timestamp();
+        let entry = MetadataCache {
+            metadata,
+            cached_at: now,
+            ttl_seconds,
+            stale_ttl_seconds,
+            needs_refresh: false,
+        };
+        let key = (symbol_short!("METACACHE"), anchor);
+        let total_ttl = ttl_seconds.saturating_add(stale_ttl_seconds);
+        let ledger_ttl = if total_ttl as u32 > MIN_TEMP_TTL { total_ttl as u32 } else { MIN_TEMP_TTL };
+        env.storage().temporary().set(&key, &entry);
+        env.storage().temporary().extend_ttl(&key, ledger_ttl, ledger_ttl);
     }
 
     // -----------------------------------------------------------------------
@@ -1792,6 +2072,107 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
         best
     }
 
+    /// Return up to `max_results` quotes sorted by descending weighted composite score.
+    /// Weights (scaled ×1000) must sum to 1000; panics with `InvalidWeights` otherwise.
+    pub fn route_anchors(
+        env: Env,
+        fee_weight: u32,       // scaled ×1000, e.g. 333 = 0.333
+        speed_weight: u32,
+        reputation_weight: u32,
+        max_results: u32,
+        min_reputation: u32,
+    ) -> Vec<Quote> {
+        let fw = fee_weight as f32 / 1000.0_f32;
+        let sw = speed_weight as f32 / 1000.0_f32;
+        let rw = reputation_weight as f32 / 1000.0_f32;
+        let strategy = WeightedRoutingStrategy {
+            fee_weight: fw,
+            speed_weight: sw,
+            reputation_weight: rw,
+        };
+        if !strategy.validate() {
+            panic_with_error!(&env, ErrorCode::InvalidWeights);
+        }
+
+        let now = env.ledger().timestamp();
+        let list_key = soroban_sdk::vec![&env, symbol_short!("ANCHLIST")];
+        let anchors: Vec<Address> = env.storage().persistent()
+            .get::<_, Vec<Address>>(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // First pass: find max values for normalisation
+        let mut max_fee: u32 = 1;
+        let mut max_settlement: u64 = 1;
+        let mut max_reputation: u32 = 1;
+
+        for anchor in anchors.iter() {
+            let meta: RoutingAnchorMeta = match anchor_meta_opt(&env, &anchor) {
+                Some(m) if m.is_active && m.reputation_score >= min_reputation => m,
+                _ => continue,
+            };
+            let lq_key = (symbol_short!("LATESTQ"), anchor.clone());
+            let quote_id: u64 = match env.storage().persistent().get(&lq_key) {
+                Some(id) => id,
+                None => continue,
+            };
+            let q_key = (symbol_short!("QUOTE"), anchor.clone(), quote_id);
+            let quote: Quote = match env.storage().persistent().get(&q_key) {
+                Some(q) => q,
+                None => continue,
+            };
+            if quote.valid_until <= now { continue; }
+            if meta.average_settlement_time > max_settlement { max_settlement = meta.average_settlement_time; }
+            if meta.reputation_score > max_reputation { max_reputation = meta.reputation_score; }
+            if quote.fee_percentage > max_fee { max_fee = quote.fee_percentage; }
+        }
+
+        // Second pass: score into a native vec, then sort
+        let mut scored: alloc::vec::Vec<(u32, Quote)> = alloc::vec::Vec::new();
+
+        for anchor in anchors.iter() {
+            let meta: RoutingAnchorMeta = match anchor_meta_opt(&env, &anchor) {
+                Some(m) if m.is_active && m.reputation_score >= min_reputation => m,
+                _ => continue,
+            };
+            let lq_key = (symbol_short!("LATESTQ"), anchor.clone());
+            let quote_id: u64 = match env.storage().persistent().get(&lq_key) {
+                Some(id) => id,
+                None => continue,
+            };
+            let q_key = (symbol_short!("QUOTE"), anchor.clone(), quote_id);
+            let quote: Quote = match env.storage().persistent().get(&q_key) {
+                Some(q) => q,
+                None => continue,
+            };
+            if quote.valid_until <= now { continue; }
+
+            let score = strategy.score_anchor(
+                quote.fee_percentage,
+                meta.average_settlement_time,
+                meta.reputation_score,
+                max_fee,
+                max_settlement,
+                max_reputation,
+            );
+            scored.push(((score * 1_000_000.0_f32) as u32, quote));
+        }
+
+        // Sort descending by score
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+        // Return top max_results quotes as a Soroban Vec
+        let limit = if max_results == 0 { 3u32 } else { max_results };
+        let mut result: Vec<Quote> = Vec::new(&env);
+        for (_, quote) in scored.into_iter().take(limit as usize) {
+            result.push_back(quote);
+        }
+        result
+    }
+
+
+        let limit = if max_results == 0 { 3u32 } else { max_results };
+        let mut result: Vec<Quote> = Vec::new(&env);
+        let mut taken = 0u32;
     // -----------------------------------------------------------------------
     // Anchor Info Discovery
     // -----------------------------------------------------------------------
@@ -1994,6 +2375,20 @@ pub fn is_attestor(env: Env, attestor: Address) -> bool {
             .has(&(symbol_short!("ATTESTOR"), attestor.clone()))
         {
             panic_with_error!(env, ErrorCode::AttestorNotRegistered);
+        }
+    }
+
+    fn verify_attestation_signature(env: &Env, issuer: &Address, payload_hash: &Bytes, signature: &Bytes) {
+        let pk: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&(symbol_short!("ATPUBKEY"), issuer.clone()))
+            .unwrap_or_else(|| panic_with_error!(env, ErrorCode::UnauthorizedAttestor));
+        if signature.len() != 64 {
+            panic_with_error!(env, ErrorCode::UnauthorizedAttestor);
+        }
+        if !env.crypto().ed25519_verify(&pk, payload_hash, signature) {
+            panic_with_error!(env, ErrorCode::UnauthorizedAttestor);
         }
     }
 
